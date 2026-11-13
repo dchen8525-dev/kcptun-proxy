@@ -11,3 +11,8 @@ traces/
 # Local scratch
 .DS_Store
 bench-*.txt
+
+# Desktop shell (Electron) — dependencies and shipped Go binary
+desktop/node_modules/
+desktop/resources/kcptun-client
+desktop/resources/kcptun-client.exe
