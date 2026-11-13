@@ -5,4 +5,7 @@
 *.md   text eol=lf
 *.mod  text eol=lf
 *.sum  text eol=lf
+# systemd units are scp'd straight to Linux; a stray \r can break directives.
+*.service text eol=lf
+*.cjs  text eol=lf
 *.ps1  text eol=crlf
