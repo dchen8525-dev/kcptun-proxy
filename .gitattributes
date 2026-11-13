@@ -1,0 +1,8 @@
+# Shell scripts must stay LF even on a Windows checkout (core.autocrlf=true),
+# otherwise Linux/bash sees a stray \r after the shebang.
+*.sh   text eol=lf
+*.go   text eol=lf
+*.md   text eol=lf
+*.mod  text eol=lf
+*.sum  text eol=lf
+*.ps1  text eol=crlf
