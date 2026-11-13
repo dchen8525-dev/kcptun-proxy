@@ -1,0 +1,13 @@
+# Build artifacts
+dist/
+*.exe
+
+# Runtime output
+logs/
+traces/
+*.log
+*.jsonl
+
+# Local scratch
+.DS_Store
+bench-*.txt
