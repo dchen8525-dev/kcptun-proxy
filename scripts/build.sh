@@ -18,6 +18,9 @@ build_one() {
     echo "build -> ${OUT}/${name}"
     CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
       "$GO" build -trimpath -ldflags "$LDFLAGS" -o "${OUT}/${name}" "./cmd/kcptun-${role}"
+    if [ -z "$suffix" ]; then
+      chmod +x "${OUT}/${name}"
+    fi
   done
 }
 
