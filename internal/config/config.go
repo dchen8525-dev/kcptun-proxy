@@ -453,7 +453,7 @@ const serverUsage = `Usage: kcptun-server [options]
                         address, dials it over TCP, and relays both directions.
 ` + commonUsage + `
 Example:
-  kcptun-server --key=00112233445566778899aabbccddeeff -b 0.0.0.0:4462 --fec=10:3
+  kcptun-server --key=00112233445566778899aabbccddeeff -b=0.0.0.0:4462 --fec=10:3
 `
 
 const clientUsage = `Usage: kcptun-client [options]

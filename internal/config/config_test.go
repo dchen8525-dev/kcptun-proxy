@@ -201,3 +201,31 @@ func TestFECDisabled(t *testing.T) {
 		t.Fatalf("fec=10:0 should disable FEC: %+v", c)
 	}
 }
+
+// TestUsageExamplesAreRunnable guards against the help text drifting away from
+// the parser. A space-separated value in an example is a hard error here, so a
+// stale example would hand the user a command line that cannot start.
+func TestUsageExamplesAreRunnable(t *testing.T) {
+	const marker = "Example:\n"
+	cases := []struct {
+		role  string
+		usage string
+	}{
+		{"server", serverUsage},
+		{"client", clientUsage},
+	}
+	for _, tc := range cases {
+		i := strings.Index(tc.usage, marker)
+		if i < 0 {
+			t.Fatalf("%s usage has no Example section", tc.role)
+		}
+		line := strings.Split(strings.TrimSpace(tc.usage[i+len(marker):]), "\n")[0]
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			t.Fatalf("bad %s example line: %q", tc.role, line)
+		}
+		if _, err := Parse(tc.role, fields[1:]); err != nil {
+			t.Fatalf("%s example is not runnable: %v\n%s", tc.role, err, line)
+		}
+	}
+}

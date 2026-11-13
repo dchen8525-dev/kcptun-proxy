@@ -1,0 +1,25 @@
+# systemd unit for the kcptun-proxy server on Debian/Ubuntu VPS.
+#
+# Install:
+#   scp deploy/kcptun-server.service your-vps:/etc/systemd/system/
+#   ssh your-vps 'chmod 600 /etc/systemd/system/kcptun-server.service &&
+#                systemctl daemon-reload && systemctl enable --now kcptun-server'
+#
+# The PSK lives in this file, hence mode 0600. Keep --key/--fec/--mtu identical
+# on the client: this build has no parameter negotiation.
+[Unit]
+Description=kcptun-proxy KCP tunnel server (UDP 4462)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/kcptun-server --key=00112233445566778899aabbccddeeff -b=0.0.0.0:4462 --fec=10:3 --mtu=1400 --log-level=info
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
