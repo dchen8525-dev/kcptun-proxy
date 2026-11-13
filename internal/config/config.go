@@ -35,7 +35,7 @@ const (
 
 // Version is a var so build.sh can inject the release tag with -ldflags -X.
 // -h prints it on the first line; there is deliberately no --version flag.
-var Version = "0.1.0"
+var Version = "0.0.1"
 
 // Config is the parsed, validated result. Nothing in here is a "maybe": every
 // field is either an explicit user value or a documented constant.
@@ -244,7 +244,10 @@ func apply(c *Config, role string, raw map[string]string) error {
 	}
 
 	if v, ok := raw["mtu"]; ok {
-		n, err := parseInt(v, 576, 9000)
+		// kcp-go clamps the UDP payload to 1472 bytes, so anything above
+		// 1500 (1472 + 28) would be silently reduced -- exactly the kind of
+		// quiet fallback this parser exists to prevent.
+		n, err := parseInt(v, 576, 1500)
 		if err != nil {
 			return fmt.Errorf("--mtu: %w", err)
 		}
@@ -422,7 +425,9 @@ Tuning:
                         P=0 disables FEC entirely. Unlike FCP, P is a FIXED
                         value here: kcp-go has no loss-driven parity controller.
   --mtu=N               UDP datagram bytes INCLUDING 20B IPv4 + 8B UDP headers
-                        (default 1400, range 576..9000). Internally SetMtu(N-28).
+                        (default 1400, range 576..1500). Internally SetMtu(N-28).
+                        kcp-go caps the UDP payload at 1472 bytes, so 1500 is the
+                        real ceiling; larger values are rejected, not clamped.
                         kcp-go has no PMTUD: this is one fixed budget, not a
                         probe floor. Keep both ends equal.
 

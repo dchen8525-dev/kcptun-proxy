@@ -4,7 +4,7 @@
 // UI down.
 'use strict';
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage } = require('electron');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -17,23 +17,30 @@ process.on('unhandledRejection', (e) => { console.error('[kcptun-desktop] unhand
 
 const IS_PACKAGED = app.isPackaged;
 
-// In dev the Go binary lives next to the repo's dist/ output; once packaged it
-// is shipped in the app's resources dir (asar:false).
+// In dev the Go binary lives next to the repo's dist/ output under its
+// release name; once packaged copy-binary.mjs stages it under resources/ and
+// electron-builder's extraResources puts it directly in process.resourcesPath.
+// The two names differ, and the packaged one is not versioned.
 const PLATFORM_BIN = process.platform === 'win32'
   ? 'kcptun-client-windows-amd64.exe'
   : process.platform === 'linux'
     ? 'kcptun-client-linux-amd64'
     : null;
-const CLI_PATH = IS_PACKAGED
-  ? path.join(process.resourcesPath, 'kcptun-client.exe')
-  : path.join(__dirname, '..', '..', 'dist', PLATFORM_BIN);
+const PACKAGED_BIN = process.platform === 'win32' ? 'kcptun-client.exe' : 'kcptun-client';
+const CLI_PATH = !PLATFORM_BIN
+  ? null
+  : IS_PACKAGED
+    ? path.join(process.resourcesPath, PACKAGED_BIN)
+    : path.join(__dirname, '..', '..', 'dist', PLATFORM_BIN);
 
 const SETTINGS_PATH = () => path.join(app.getPath('userData'), 'settings.json');
 
 let win = null;
+let tray = null;
+let isQuitting = false;
+let trayHinted = false;
 let child = null;
 let childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
-let speedJob = null;
 
 // ---------------------------------------------------------------- settings
 
@@ -49,7 +56,12 @@ function writeSettings(patch) {
   const next = { ...readSettings(), ...patch };
   try {
     fs.mkdirSync(path.dirname(SETTINGS_PATH()), { recursive: true });
-    fs.writeFileSync(SETTINGS_PATH(), JSON.stringify(next, null, 2), 'utf8');
+    // The file holds the PSK in clear text; keep it owner-only where the
+    // platform honours modes (Linux/macOS).
+    fs.writeFileSync(SETTINGS_PATH(), JSON.stringify(next, null, 2), {
+      encoding: 'utf8',
+      mode: 0o600,
+    });
   } catch (e) {
     send('kcp:log', { level: 'warn', line: `settings: ${e.message}` });
   }
@@ -62,17 +74,73 @@ function send(channel, payload) {
 
 // ---------------------------------------------------------------- tunnel
 
+// IPC is a trust boundary: whatever the renderer sends becomes argv elements
+// and a log-file path, so it is validated here instead of relying on the form.
+const HEX32 = /^[0-9a-fA-F]{32}$/;
+const LOG_LEVELS = new Set(['debug', 'info', 'warn', 'error', 'off']);
+
+function intIn(v, lo, hi) {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= lo && n <= hi ? n : null;
+}
+
+function joinHostPort(host, port) {
+  const h = String(host).trim();
+  if (h.startsWith('[')) return `${h}:${port}`;
+  return h.includes(':') ? `[${h}]:${port}` : `${h}:${port}`;
+}
+
+// Returns a normalized config with the argv-ready peer/bind strings, or
+// { error } when the renderer sent something the CLI would reject anyway.
+function tunnelConfig(raw) {
+  const cfg = raw && typeof raw === 'object' ? raw : {};
+  const key = String(cfg.key || '').replace(/^0x/i, '').trim().replace(/\s+/g, '');
+  if (!HEX32.test(key)) return { error: 'key must be 32 hex characters' };
+
+  const host = typeof cfg.host === 'string' ? cfg.host.trim() : '';
+  if (!host || /[\s\0]/.test(host)) return { error: 'invalid server host' };
+  const listenHost = typeof cfg.listenHost === 'string' && cfg.listenHost.trim()
+    ? cfg.listenHost.trim() : '127.0.0.1';
+  if (/[\s\0]/.test(listenHost)) return { error: 'invalid listen host' };
+
+  const port = intIn(cfg.port, 1, 65535);
+  const listenPort = intIn(cfg.listenPort, 1, 65535);
+  if (port === null) return { error: 'server port must be 1..65535' };
+  if (listenPort === null) return { error: 'listen port must be 1..65535' };
+
+  let mtu = null;
+  if (cfg.mtu !== undefined && cfg.mtu !== null && cfg.mtu !== '') {
+    mtu = intIn(cfg.mtu, 576, 1500);
+    if (mtu === null) return { error: 'MTU must be 576..1500' };
+  }
+  const fec = cfg.fec === undefined || cfg.fec === null || cfg.fec === ''
+    ? '10:3'
+    : String(cfg.fec).trim();
+  if (!/^\d{1,3}:\d{1,3}$/.test(fec)) return { error: 'FEC must look like 10:3' };
+
+  const logLevel = LOG_LEVELS.has(cfg.logLevel) ? cfg.logLevel : 'info';
+  const logFile = typeof cfg.logFile === 'string' ? cfg.logFile : '';
+  if (logFile.includes('\0')) return { error: 'invalid log file path' };
+
+  return {
+    key,
+    peer: joinHostPort(host, port),
+    bind: joinHostPort(listenHost, listenPort),
+    displayPeer: `${host}:${port}`,
+    displayListen: `${listenHost}:${listenPort}`,
+    mtu,
+    fec,
+    logLevel,
+    logFile,
+  };
+}
+
 function statsArgs(cfg) {
   // kcptun has no PMTUD: one fixed --mtu budget, not --mtu-min/--mtu-max. FEC is
   // a single D:P geometry, not a separate parity controller.
-  const args = [
-    `--key=${cfg.key}`,
-    `--peer=${cfg.host}:${cfg.port}`,
-    `-b=${cfg.listenHost}:${cfg.listenPort}`,
-  ];
+  const args = [`--key=${cfg.key}`, `--peer=${cfg.peer}`, `-b=${cfg.bind}`];
   if (cfg.mtu) args.push(`--mtu=${cfg.mtu}`);
-  args.push(`--fec=${cfg.fec || '10:3'}`);
-  args.push(`--log-level=${cfg.logLevel || 'info'}`);
+  args.push(`--fec=${cfg.fec}`, `--log-level=${cfg.logLevel}`);
   if (cfg.logFile) args.push(`--log-file=${cfg.logFile}`);
   return args;
 }
@@ -91,24 +159,62 @@ function classify(line) {
 // identical format, so this regex is reused verbatim.
 const STATS_RE = /^stats\s+([\d.]+)s\s+live=(\d+)\s+up=(\d+)\s+tunnels=(\d+)\s+tx=(\d+)B\s+rx=(\d+)B\s+tx_rate=(-?\d+)B\/s\s+rx_rate=(-?\d+)B\/s/;
 
-function startTunnel(cfg) {
-  if (child) stopTunnel();
+function idleState() {
+  return { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
+}
+
+async function startTunnel(raw) {
+  // Wait for the previous process to release the listen port before spawning
+  // its replacement; a fire-and-forget kill leaves both bound to the same port.
+  if (child) await stopTunnel();
+
+  const cfg = tunnelConfig(raw);
+  if (cfg.error) {
+    send('kcp:log', { level: 'error', line: `config: ${cfg.error}` });
+    return { ok: false, error: cfg.error };
+  }
+  if (!CLI_PATH) {
+    return { ok: false, error: `unsupported platform: ${process.platform}` };
+  }
   if (!fs.existsSync(CLI_PATH)) {
     send('kcp:log', { level: 'error', line: `missing kcptun-client binary: ${CLI_PATH}` });
     return { ok: false, error: 'missing kcptun-client binary' };
   }
-  const args = statsArgs(cfg);
-  child = spawn(CLI_PATH, args, {
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
+
+  let proc;
+  try {
+    proc = spawn(CLI_PATH, statsArgs(cfg), {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (e) {
+    return { ok: false, error: `spawn failed: ${e.message}` };
+  }
+  // Attach before any early return: an asynchronous ENOENT/EACCES arrives as an
+  // 'error' event, and an unhandled one would crash the main process.
+  proc.on('error', (e) => {
+    send('kcp:log', { level: 'error', line: `tunnel spawn failed: ${e.message}` });
+    if (child !== proc) return;
+    child = null;
+    childState = idleState();
+    send('kcp:state', childState);
+    refreshTray();
   });
-  childState = { running: true, pid: child.pid || 0, startedAt: Date.now(),
-    peer: `${cfg.host}:${cfg.port}`, listen: `${cfg.listenHost}:${cfg.listenPort}` };
+  // spawn reports ENOENT/EACCES asynchronously, but pid is already unset then;
+  // returning ok for a process that never started would leave the UI lying.
+  if (!proc.pid) return { ok: false, error: 'spawn failed' };
+
+  child = proc;
+  childState = {
+    running: true, pid: proc.pid, startedAt: Date.now(),
+    peer: cfg.displayPeer, listen: cfg.displayListen,
+  };
   send('kcp:state', childState);
+  refreshTray();
 
   let buf = '';
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', (chunk) => {
+  proc.stdout.setEncoding('utf8');
+  proc.stdout.on('data', (chunk) => {
     buf += chunk;
     let idx;
     while ((idx = buf.indexOf('\n')) >= 0) {
@@ -127,49 +233,56 @@ function startTunnel(cfg) {
       }
     }
   });
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', (chunk) => {
-    for (const raw of chunk.split('\n')) {
-      const line = raw.trimEnd();
-      if (!line) continue;
-      send('kcp:log', { level: classify(line), line });
+  proc.stderr.setEncoding('utf8');
+  proc.stderr.on('data', (chunk) => {
+    for (const line of chunk.split('\n')) {
+      const text = line.trimEnd();
+      if (!text) continue;
+      send('kcp:log', { level: classify(text), line: text });
     }
   });
-  child.on('exit', (code, signal) => {
-    const wasRunning = childState.running;
+  proc.on('exit', (code, signal) => {
+    // A stopped or superseded process must not clear the state of its
+    // successor: stopTunnel() already nulled `child` before killing it.
+    if (child !== proc) return;
     child = null;
-    childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
+    childState = idleState();
     send('kcp:state', childState);
-    if (wasRunning) {
-      send('kcp:log', { level: code === 0 ? 'info' : 'error',
-        line: `tunnel exited: code=${code} signal=${signal || 'none'}` });
-    }
+    refreshTray();
+    send('kcp:log', { level: code === 0 ? 'info' : 'error',
+      line: `tunnel exited: code=${code} signal=${signal || 'none'}` });
   });
-  child.on('error', (e) => {
-    send('kcp:log', { level: 'error', line: `tunnel spawn failed: ${e.message}` });
-    child = null;
-    childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
-    send('kcp:state', childState);
-  });
-  return { ok: true, pid: child.pid };
+  return { ok: true, pid: proc.pid };
 }
 
 function stopTunnel() {
-  if (!child) return { ok: true };
-  const c = child;
+  const proc = child;
+  if (!proc) return Promise.resolve({ ok: true });
   child = null;
-  try {
-    // SIGTERM lets the tunnel close its sockets; the forced kill is the escape
-    // hatch for a wedged process (Windows has no SIGTERM delivery for GUI
-    // children, so taskkill is what actually lands there).
-    c.kill('SIGTERM');
-    setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* already gone */ } }, 1500);
-  } catch {
-    /* already gone */
-  }
-  childState = { running: false, pid: 0, startedAt: 0, peer: '', listen: '' };
+  childState = idleState();
   send('kcp:state', childState);
-  return { ok: true };
+  refreshTray();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: true });
+    };
+    proc.once('exit', finish);
+    try {
+      // SIGTERM lets the tunnel close its sockets; the forced kill is the escape
+      // hatch for a wedged process (Windows has no SIGTERM delivery for GUI
+      // children, so TerminateProcess is what actually lands there).
+      proc.kill('SIGTERM');
+    } catch {
+      finish();
+      return;
+    }
+    setTimeout(() => { try { proc.kill('SIGKILL'); } catch { finish(); } }, 1500);
+    // Never hang a restart on a process the OS refuses to reap.
+    setTimeout(finish, 3000);
+  });
 }
 
 // ---------------------------------------------------------------- speed test
@@ -178,76 +291,228 @@ function stopTunnel() {
 // that says nothing about the path the user cares about. This one dials the
 // local SOCKS listener the tunnel exposes and pulls a real URL through it.
 
+function ipv6Bytes(ip) {
+  const expandV4 = (parts) => {
+    if (!parts.length) return parts;
+    const last = parts[parts.length - 1];
+    if (!last.includes('.')) return parts;
+    const octets = last.split('.').map(Number);
+    if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+    return parts.slice(0, -1).concat(
+      (((octets[0] << 8) | octets[1]) >>> 0).toString(16),
+      (((octets[2] << 8) | octets[3]) >>> 0).toString(16));
+  };
+  let head = ip;
+  let tail = '';
+  const dbl = ip.indexOf('::');
+  if (dbl >= 0) {
+    head = ip.slice(0, dbl);
+    tail = ip.slice(dbl + 2);
+  }
+  const h = expandV4(head ? head.split(':') : []);
+  const t = expandV4(tail ? tail.split(':') : []);
+  if (!h || !t) return null;
+  const missing = 8 - h.length - t.length;
+  // "::" stands for at least one zero group, so a full 8-group address must not
+  // carry it; the caller has already validated the literal with net.isIP.
+  if (missing < 0 || (dbl < 0 ? missing !== 0 : missing < 1)) return null;
+  const groups = [...h, ...Array(missing).fill('0'), ...t];
+  const out = Buffer.alloc(16);
+  for (let i = 0; i < 8; i += 1) {
+    const g = parseInt(groups[i], 16);
+    if (!Number.isInteger(g) || g < 0 || g > 0xffff) return null;
+    out.writeUInt16BE(g, i * 2);
+  }
+  return out;
+}
+
+function buildConnectRequest(host, port) {
+  const bare = host.replace(/^\[/, '').replace(/\]$/, '');
+  if (net.isIP(bare) === 4) {
+    const out = Buffer.alloc(10);
+    out[0] = 0x05; out[1] = 0x01; out[2] = 0x00; out[3] = 0x01;
+    bare.split('.').forEach((octet, i) => { out[4 + i] = Number(octet); });
+    out.writeUInt16BE(port, 8);
+    return out;
+  }
+  if (net.isIP(bare) === 6) {
+    const raw = ipv6Bytes(bare);
+    if (raw) {
+      const out = Buffer.alloc(22);
+      out[0] = 0x05; out[1] = 0x01; out[2] = 0x00; out[3] = 0x04;
+      raw.copy(out, 4);
+      out.writeUInt16BE(port, 20);
+      return out;
+    }
+  }
+  const name = Buffer.from(bare, 'utf8');
+  const out = Buffer.alloc(7 + name.length);
+  out[0] = 0x05; out[1] = 0x01; out[2] = 0x00; out[3] = 0x03;
+  out[4] = name.length;
+  name.copy(out, 5);
+  out.writeUInt16BE(port, 5 + name.length);
+  return out;
+}
+
+// TCP may split the SOCKS greeting/reply arbitrarily, so both stages buffer
+// until a complete message is present instead of indexing into one chunk.
 function socksConnect(socksHost, socksPort, host, port, timeoutMs = 8000) {
   return new Promise((resolve, reject) => {
     const sock = net.connect(socksPort, socksHost);
     let stage = 0;
-    const fail = (e) => { sock.destroy(); reject(e); };
-    const timer = setTimeout(() => fail(new Error('SOCKS handshake timeout')), timeoutMs);
+    let settled = false;
+    let pending = Buffer.alloc(0);
+    let timer = null;
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock.destroy();
+      reject(e);
+    };
+    timer = setTimeout(() => fail(new Error('SOCKS handshake timeout')), timeoutMs);
     sock.setNoDelay(true);
     sock.on('error', fail);
     sock.on('close', () => { if (stage < 2) fail(new Error('SOCKS closed early')); });
     sock.on('connect', () => sock.write(Buffer.from([0x05, 0x01, 0x00])));
-    sock.on('data', function onData(buf) {
+    sock.on('data', function onData(chunk) {
+      if (settled) return;
+      pending = Buffer.concat([pending, chunk]);
       if (stage === 0) {
-        if (buf[0] !== 0x05 || buf[1] !== 0x00) return fail(new Error('SOCKS greeting rejected'));
+        if (pending.length < 2) return;
+        if (pending[0] !== 0x05 || pending[1] !== 0x00) return fail(new Error('SOCKS greeting rejected'));
+        pending = pending.subarray(2);
         stage = 1;
-        const name = Buffer.from(host, 'utf8');
-        const req = Buffer.alloc(7 + name.length);
-        req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x03;
-        req[4] = name.length; name.copy(req, 5);
-        req.writeUInt16BE(port, 5 + name.length);
-        sock.write(req);
+        sock.write(buildConnectRequest(host, port));
+      }
+      if (stage === 1) {
+        if (pending.length < 4) return;
+        if (pending[0] !== 0x05) return fail(new Error('SOCKS: bad reply version'));
+        const atyp = pending[3];
+        let need;
+        if (atyp === 0x01) need = 10;
+        else if (atyp === 0x04) need = 22;
+        else if (atyp === 0x03) {
+          if (pending.length < 5) return;
+          need = 5 + pending[4] + 2;
+        } else {
+          return fail(new Error(`SOCKS: bad ATYP 0x${atyp.toString(16)}`));
+        }
+        if (pending.length < need) return;
+        if (pending[1] !== 0x00) return fail(new Error(`SOCKS connect failed (rep=${pending[1]})`));
+        settled = true;
+        stage = 2;
+        clearTimeout(timer);
         sock.removeListener('data', onData);
-        sock.once('data', (reply) => {
-          if (reply[0] !== 0x05 || reply[1] !== 0x00) {
-            return fail(new Error(`SOCKS connect failed (rep=${reply[1]})`));
-          }
-          clearTimeout(timer);
-          stage = 2;
-          sock.removeAllListeners('close');
-          resolve(sock);
-        });
-        return;
+        sock.removeAllListeners('close');
+        const left = pending.subarray(need);
+        if (left.length) sock.unshift(left);
+        resolve(sock);
       }
     });
   });
 }
 
-async function runSpeedTest(cfg, onDone) {
+// Each run owns its socket through `job`, so a finishing or cancelled run can
+// only tear down itself -- never a replacement started in the meantime.
+let speedJob = null; // { sock, finished, cancelled, finish }
+
+function speedConfig(raw) {
+  const cfg = raw && typeof raw === 'object' ? raw : {};
+  const url = String(cfg.url || '');
+  let target;
+  try {
+    target = new URL(url);
+  } catch {
+    return { error: 'invalid speed test URL' };
+  }
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+    return { error: 'speed test URL must be http:// or https://' };
+  }
+  const socksPort = intIn(cfg.socksPort, 1, 65535);
+  return {
+    url,
+    target,
+    socksHost: typeof cfg.socksHost === 'string' && cfg.socksHost ? cfg.socksHost : '127.0.0.1',
+    socksPort: socksPort === null ? 1080 : socksPort,
+    seconds: Math.min(60, Math.max(3, intIn(cfg.seconds, 1, 600) ?? 10)),
+  };
+}
+
+function startSpeedTest(raw) {
+  stopSpeedTest();
+  const cfg = speedConfig(raw);
+  if (cfg.error) {
+    send('kcp:speed', {
+      done: true, ok: false, bytes: 0, seconds: 0, mbps: 0, mbPerSec: 0,
+      error: cfg.error, url: String((raw && raw.url) || ''),
+    });
+    return;
+  }
+  const job = { sock: null, finished: false, cancelled: false, finish: null };
+  speedJob = job;
+  void runSpeedTest(cfg, job).catch((e) => {
+    if (job.finish) job.finish(`internal: ${e.message}`);
+  });
+}
+
+function stopSpeedTest() {
+  const job = speedJob;
+  speedJob = null;
+  if (!job) return;
+  job.cancelled = true;
+  if (job.finish) job.finish('cancelled');
+}
+
+async function runSpeedTest(cfg, job) {
   const started = Date.now();
-  const target = new URL(cfg.url);
+  const target = cfg.target;
   const host = target.hostname;
   const port = Number(target.port || (target.protocol === 'https:' ? 443 : 80));
   const tlsTarget = target.protocol === 'https:';
-  let total = 0, headerBytes = 0, ended = false;
+  let total = 0;
+  let headerBytes = 0;
+  let headBuf = null;
+  let headDone = false;
 
   const finish = (message) => {
-    if (ended) return;
-    ended = true;
+    if (job.finished) return;
+    job.finished = true;
     const elapsed = Math.max(0.2, (Date.now() - started) / 1000);
     const body = Math.max(0, total - headerBytes);
-    const result = {
-      ok: !message, bytes: body, seconds: elapsed,
-      mbps: body * 8 / elapsed / 1e6, mbPerSec: body / elapsed / 1048576,
+    if (job.sock) {
+      try { job.sock.destroy(); } catch { /* already closed */ }
+      job.sock = null;
+    }
+    if (speedJob === job) speedJob = null;
+    if (job.cancelled) return;
+    send('kcp:speed', {
+      done: true, ok: !message, bytes: body, seconds: elapsed,
+      mbps: (body * 8) / elapsed / 1e6, mbPerSec: body / elapsed / 1048576,
       error: message || '', url: cfg.url,
-    };
-    send('kcp:speed', { done: true, ...result });
-    if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
-    if (onDone) onDone(result);
+    });
   };
+  job.finish = finish;
 
   let sock;
   try {
-    sock = await socksConnect(cfg.socksHost || '127.0.0.1', cfg.socksPort || 1080, host, port);
+    sock = await socksConnect(cfg.socksHost, cfg.socksPort, host, port);
   } catch (e) {
     finish(`SOCKS: ${e.message}`);
     return;
   }
-  speedJob = sock;
+  if (job.cancelled) {
+    try { sock.destroy(); } catch { /* closed */ }
+    return;
+  }
+  job.sock = sock;
   if (tlsTarget) {
-    sock = tls.connect({ socket: sock, servername: host },
-      () => sock.write(buildRequest(target, host)));
+    const bare = host.replace(/^\[/, '').replace(/\]$/, '');
+    const tlsOpts = { socket: sock };
+    if (net.isIP(bare)) tlsOpts.host = bare;
+    else tlsOpts.servername = bare;
+    sock = tls.connect(tlsOpts, () => sock.write(buildRequest(target, host)));
+    job.sock = sock;
     sock.on('error', (e) => finish(`TLS: ${e.message}`));
   } else {
     sock.write(buildRequest(target, host));
@@ -255,27 +520,105 @@ async function runSpeedTest(cfg, onDone) {
   }
   sock.on('data', (b) => {
     total += b.length;
-    if (headerBytes === 0) {
-      const text = b.subarray(0, Math.min(b.length, 2048)).toString('latin1');
-      const idx = text.indexOf('\r\n\r\n');
-      if (idx >= 0) headerBytes = Math.min(b.length, idx + 4);
+    if (!headDone) {
+      headBuf = headBuf ? Buffer.concat([headBuf, b]) : b;
+      const idx = headBuf.indexOf('\r\n\r\n');
+      if (idx >= 0) {
+        headerBytes = idx + 4;
+        headDone = true;
+        headBuf = null;
+      } else if (headBuf.length > 32 << 10) {
+        headDone = true;
+        headBuf = null;
+      }
     }
-    if (Date.now() - started > (cfg.seconds || 10) * 1000) finish('');
+    if (Date.now() - started > cfg.seconds * 1000) finish('');
   });
-  sock.on('close', () => { if (!ended) finish(''); });
-  sock.on('end', () => { if (!ended) finish(''); });
-  setTimeout(() => finish(''), (cfg.seconds || 10) * 1000 + 250);
-  send('kcp:speed', { done: false, url: cfg.url, seconds: (cfg.seconds || 10) });
+  sock.on('close', () => finish(''));
+  sock.on('end', () => finish(''));
+  setTimeout(() => finish(''), cfg.seconds * 1000 + 250);
+  send('kcp:speed', { done: false, url: cfg.url, seconds: cfg.seconds });
 }
 
 function buildRequest(target, host) {
   const pathAndQuery = `${target.pathname || '/'}${target.search || ''}`;
   return `GET ${pathAndQuery} HTTP/1.1\r\n` +
     `Host: ${host}\r\n` +
-    'User-Agent: kcptun-desktop/0.1.0\r\n' +
+    'User-Agent: kcptun-desktop/0.0.1\r\n' +
     'Accept: */*\r\n' +
     'Accept-Encoding: identity\r\n' +
     'Connection: close\r\n\r\n';
+}
+
+// ---------------------------------------------------------------- tray
+
+// The window's X button hides to the tray instead of quitting, so the tray has
+// to be the one place that explains the app is still alive and offers a way out.
+function trayMenu() {
+  return Menu.buildFromTemplate([
+    {
+      label: childState.running ? `运行中 · ${childState.listen}` : '隧道未启动',
+      enabled: false,
+    },
+    { type: 'separator' },
+    { label: win && win.isVisible() ? '隐藏主界面' : '显示主界面', click: toggleWindow },
+    { type: 'separator' },
+    { label: '退出 KCPtun', click: () => { isQuitting = true; app.quit(); } },
+  ]);
+}
+
+function refreshTray() {
+  if (!tray) return;
+  tray.setToolTip(childState.running ? `KCPtun · 运行中 ${childState.listen}` : 'KCPtun · 未启动');
+  tray.setContextMenu(trayMenu());
+}
+
+function createTray() {
+  if (tray) return;
+  const icon = nativeImage.createFromPath(path.join(__dirname, 'assets', 'tray.png'));
+  if (icon.isEmpty()) {
+    console.error('[kcptun-desktop] tray icon missing: assets/tray.png');
+  }
+  try {
+    tray = new Tray(icon);
+  } catch (e) {
+    // Some Linux sessions have no status-icon host; the window must still work,
+    // and window-all-closed falls back to quitting when there is no tray.
+    console.error('[kcptun-desktop] tray unavailable:', e.message);
+    return;
+  }
+  tray.on('click', showWindow);
+  tray.on('balloon-click', showWindow);
+  refreshTray();
+  console.log('[kcptun-desktop] tray ready');
+}
+
+function showWindow() {
+  if (!win) {
+    createWindow();
+    return;
+  }
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
+function hideWindow() {
+  if (win && win.isVisible()) win.hide();
+}
+
+function toggleWindow() {
+  if (win && win.isVisible()) hideWindow();
+  else showWindow();
+}
+
+function hintTray() {
+  if (trayHinted || process.platform !== 'win32' || !tray) return;
+  trayHinted = true;
+  tray.displayBalloon({
+    title: 'KCPtun 仍在运行',
+    content: '窗口已收起到托盘，点击托盘图标可重新打开。',
+  });
 }
 
 // ---------------------------------------------------------------- window
@@ -285,6 +628,7 @@ function createWindow() {
     width: 980, height: 700, minWidth: 820, minHeight: 600,
     backgroundColor: '#f4f7f5',
     title: 'KCPtun',
+    icon: path.join(__dirname, 'assets', 'tray.png'),
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
@@ -294,19 +638,24 @@ function createWindow() {
       sandbox: false,
     },
   });
+  // The renderer is a local file; nothing in it should open windows or
+  // navigate away, so both are refused outright.
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('will-navigate', (event) => event.preventDefault());
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   win.once('ready-to-show', () => { win.show(); console.log('[kcptun-desktop] window ready-to-show'); });
   console.log('[kcptun-desktop] createWindow done, loading renderer');
   win.on('close', (e) => {
-    // Closing the window keeps the tunnel alive when it runs; the tray is out of
-    // scope, so this only hides the window and the app quits from the menu.
-    if (child) {
-      e.preventDefault();
-      win.hide();
-      send('kcp:log', { level: 'info', line: 'window hidden; tunnel still running' });
-    }
+    // X hides to the tray; quitting goes through the tray menu so a running
+    // tunnel is never killed by a stray click.
+    if (isQuitting) return;
+    e.preventDefault();
+    win.hide();
+    hintTray();
   });
-  win.on('closed', () => { win = null; });
+  win.on('show', refreshTray);
+  win.on('hide', refreshTray);
+  win.on('closed', () => { win = null; refreshTray(); });
 }
 
 // ---------------------------------------------------------------- ipc
@@ -317,12 +666,11 @@ ipcMain.handle('kcp:start', (_e, cfg) => startTunnel(cfg || {}));
 ipcMain.handle('kcp:stop', () => stopTunnel());
 ipcMain.handle('kcp:state', () => childState);
 ipcMain.handle('kcp:speed:start', (_e, cfg) => {
-  if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
-  runSpeedTest(cfg || {});
+  startSpeedTest(cfg || {});
   return { ok: true };
 });
 ipcMain.handle('kcp:speed:stop', () => {
-  if (speedJob) { try { speedJob.destroy(); } catch { /* closed */ } speedJob = null; }
+  stopSpeedTest();
   return { ok: true };
 });
 ipcMain.handle('kcp:open-log-dir', async () => {
@@ -341,18 +689,25 @@ ipcMain.handle('kcp:pick-url', async () => {
   return r.response === 1 ? 'https://downloads.claude.ai/claude-code-releases/2.1.319/win32-x64/claude.exe' : '';
 });
 
-app.on('second-instance', () => {
-  if (win) { win.show(); win.focus(); }
-});
+app.on('second-instance', () => { showWindow(); });
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.whenReady().then(() => { console.log('[kcptun-desktop] app ready'); createWindow(); });
+  app.whenReady().then(() => {
+    console.log('[kcptun-desktop] app ready');
+    createWindow();
+    createTray();
+  });
+  // With a tray icon the app outlives its window; on a desktop without a usable
+  // tray (some Linux sessions) fall back to quitting so it cannot become
+  // unreachable.
   app.on('window-all-closed', () => {
-    if (child) return;  // tunnel keeps the app alive; quit from the menu
+    if (tray) return;
+    if (child) return;
     app.quit();
   });
-  app.on('before-quit', () => { stopTunnel(); });
+  app.on('before-quit', () => { isQuitting = true; stopTunnel(); });
+  app.on('will-quit', () => { if (tray) { tray.destroy(); tray = null; } });
 }

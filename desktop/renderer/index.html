@@ -122,7 +122,7 @@
             <div class="grid two">
               <label class="field">
                 <span class="field-label">MTU（固定数据报预算）</span>
-                <input id="mtu" type="number" min="576" max="9000" value="1400" />
+                <input id="mtu" type="number" min="576" max="1500" value="1400" />
               </label>
               <label class="field">
                 <span class="field-label">FEC 几何</span>
@@ -143,7 +143,7 @@
                 <input id="logFile" type="text" placeholder="留空则不落盘" spellcheck="false" />
               </label>
             </div>
-            <p class="hint">kcptun 没有 PMTUD：MTU 是一个固定数据报预算（含 20B IPv4 + 8B UDP 头），不是探测起点。FEC 的 P 是固定值，不是自适应上限。</p>
+            <p class="hint">kcptun 没有 PMTUD：MTU 是一个固定数据报预算（含 20B IPv4 + 8B UDP 头，上限 1500），不是探测起点。FEC 的 P 是固定值，不是自适应上限。</p>
           </div>
         </div>
 

@@ -293,3 +293,46 @@ func TestInProcessSpeedtest(t *testing.T) {
 		t.Fatalf("speedtest output %q", joined)
 	}
 }
+
+// A chunked request body must arrive intact through the absolute-form path:
+// the proxy rewrites the head but relays the body bytes verbatim.
+func TestAbsoluteFormChunkedBody(t *testing.T) {
+	seen := make(chan string, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		seen <- string(b)
+		_, _ = fmt.Fprintf(w, "len=%d", len(b))
+	}))
+	defer origin.Close()
+	host := strings.TrimPrefix(origin.URL, "http://")
+
+	st := newStack(t, 3)
+	defer st.close()
+
+	c, err := net.DialTimeout("tcp", st.pl.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(15 * time.Second))
+
+	body := "hello-chunked-body"
+	fmt.Fprintf(c, "POST http://%s/up HTTP/1.1\r\nHost: %s\r\n"+
+		"Transfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n"+
+		"%x\r\n%s\r\n0\r\n\r\n", host, host, len(body), body)
+	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: "POST"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if got := <-seen; got != body {
+		t.Fatalf("origin saw body %q, want %q", got, body)
+	}
+}

@@ -1,6 +1,6 @@
 {
   "name": "kcptun-desktop",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "private": true,
   "description": "kcptun-proxy tunnel desktop shell (Electron) - drives the Go kcptun-client",
   "main": "electron/main.cjs",
@@ -25,8 +25,16 @@
     "files": [
       "electron/**/*",
       "renderer/**/*",
-      "resources/**/*",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources",
+        "to": ".",
+        "filter": [
+          "kcptun-client*"
+        ]
+      }
     ],
     "win": {
       "target": [

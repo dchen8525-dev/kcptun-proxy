@@ -296,7 +296,17 @@ func ParseEntry(br *bufio.Reader, w io.Writer) (Entry, error) {
 	return parseHTTP(br)
 }
 
-func parseSocks5(br *bufio.Reader, w io.Writer) (Entry, error) {
+func parseSocks5(br *bufio.Reader, w io.Writer) (e Entry, err error) {
+	// Once the greeting is answered the client waits for a CONNECT reply, so
+	// every later failure must be written as a SOCKS5 reply instead of a bare
+	// connection reset.
+	greeted := false
+	defer func() {
+		if err != nil && greeted {
+			_ = writeAll(w, replySocks5Fail)
+		}
+	}()
+
 	g := make([]byte, 2)
 	if _, err := io.ReadFull(br, g); err != nil {
 		return Entry{}, err
@@ -322,6 +332,7 @@ func parseSocks5(br *bufio.Reader, w io.Writer) (Entry, error) {
 	if err := writeAll(w, []byte{socks5Version, 0x00}); err != nil {
 		return Entry{}, err
 	}
+	greeted = true
 
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(br, hdr); err != nil {
@@ -369,7 +380,17 @@ func parseSocks5(br *bufio.Reader, w io.Writer) (Entry, error) {
 func readHead(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
 	for {
-		line, err := br.ReadBytes('\n')
+		// ReadSlice caps a single line at the bufio buffer size; ReadBytes would
+		// happily grow without bound while the client keeps sending before the
+		// size check below ever runs.
+		line, err := br.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			if buf.Len()+len(line) > maxHeadBytes {
+				return nil, ErrHeadTooLarge
+			}
+			buf.Write(line)
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -418,10 +439,13 @@ func parseHTTP(br *bufio.Reader) (Entry, error) {
 		return Entry{}, fmt.Errorf("%w: absolute-form URL must start with http://", ErrMalformed)
 	}
 	rest := uri[len("http://"):]
-	slash := strings.IndexByte(rest, '/')
+	end := strings.IndexAny(rest, "/?#")
 	authority, path := rest, "/"
-	if slash >= 0 {
-		authority, path = rest[:slash], rest[slash:]
+	if end >= 0 {
+		authority, path = rest[:end], rest[end:]
+		if path[0] != '/' {
+			path = "/" + path
+		}
 	}
 	host, port, err := parseAuthority(authority, 80)
 	if err != nil {
@@ -436,6 +460,20 @@ func parseHTTP(br *bufio.Reader) (Entry, error) {
 }
 
 func rewriteForward(lines []string, method, path, version string) []byte {
+	// Transfer-Encoding and Trailer are kept: this proxy relays the body bytes
+	// verbatim instead of decoding them, so dropping the framing headers would
+	// hand the origin a chunked body with no declaration (and open the door to
+	// CL.TE request smuggling). A declared Transfer-Encoding also overrides
+	// Content-Length, so that header must not travel beside it.
+	hasTE := false
+	for _, line := range lines[1:] {
+		if name, _, ok := strings.Cut(line, ":"); ok &&
+			strings.EqualFold(strings.TrimSpace(name), "transfer-encoding") {
+			hasTE = true
+			break
+		}
+	}
+
 	out := []string{method + " " + path + " " + version}
 	for _, line := range lines[1:] {
 		if line == "" {
@@ -445,10 +483,14 @@ func rewriteForward(lines []string, method, path, version string) []byte {
 		if i := strings.IndexByte(line, ':'); i >= 0 {
 			name = line[:i]
 		}
-		switch strings.ToLower(strings.TrimSpace(name)) {
+		switch lower := strings.ToLower(strings.TrimSpace(name)); lower {
 		case "connection", "proxy-connection", "keep-alive", "proxy-authenticate",
-			"proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+			"proxy-authorization", "te", "upgrade":
 			continue
+		case "content-length":
+			if hasTE {
+				continue
+			}
 		}
 		out = append(out, line)
 	}

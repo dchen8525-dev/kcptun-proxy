@@ -270,6 +270,24 @@ func (c *Client) reset() {
 	c.o.Stats.SetTunnels(0)
 }
 
+// discard closes sess only if it is still the session in use. A stream failure
+// on a session another goroutine already replaced must not kill its successor.
+func (c *Client) discard(sess *smux.Session) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sess == nil || c.sess != sess {
+		return
+	}
+	c.gen.Add(1)
+	_ = c.sess.Close()
+	if c.kconn != nil {
+		_ = c.kconn.Close()
+	}
+	c.sess, c.kconn = nil, nil
+	c.o.Stats.SetUp(0)
+	c.o.Stats.SetTunnels(0)
+}
+
 func (c *Client) session() (*smux.Session, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -277,6 +295,9 @@ func (c *Client) session() (*smux.Session, error) {
 		return c.sess, nil
 	}
 	if c.sess != nil {
+		// Invalidate the old watcher before closing: it must not zero the
+		// counters of the session dialed below.
+		c.gen.Add(1)
 		_ = c.sess.Close()
 		_ = c.kconn.Close()
 		c.sess, c.kconn = nil, nil
@@ -322,28 +343,29 @@ func (c *Client) Open(t socks.Target) (net.Conn, socks.OpenError, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		sess, err := c.session()
 		if err != nil {
+			// No session was installed, so there is nothing to discard; closing
+			// here could tear down a session another goroutine just dialed.
 			last = err
-			c.reset()
 			continue
 		}
 		st, err := sess.OpenStream()
 		if err != nil {
 			last = err
-			c.reset()
+			c.discard(sess)
 			continue
 		}
 		_ = st.SetDeadline(time.Now().Add(OpenTimeout))
 		if err := socks.WriteOpen(st, t); err != nil {
 			last = err
 			st.Close()
-			c.reset()
+			c.discard(sess)
 			continue
 		}
 		code, err := socks.ReadOpenReply(st)
 		if err != nil {
 			last = err
 			st.Close()
-			c.reset()
+			c.discard(sess)
 			continue
 		}
 		_ = st.SetDeadline(time.Time{})

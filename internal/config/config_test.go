@@ -192,6 +192,20 @@ func TestNormalizeAddr(t *testing.T) {
 	}
 }
 
+func TestMTUCeiling(t *testing.T) {
+	// 1500 is the largest datagram kcp-go can actually carry (1472B UDP
+	// payload + 28B IP/UDP headers). Anything above it must be rejected
+	// rather than silently clamped by SetMtu.
+	if _, err := Parse("client", clientArgs("--mtu=1500")); err != nil {
+		t.Fatalf("mtu=1500 rejected: %v", err)
+	}
+	for _, v := range []string{"1501", "9000"} {
+		if _, err := Parse("client", clientArgs("--mtu="+v)); err == nil {
+			t.Fatalf("mtu=%s accepted; kcp-go would silently clamp it", v)
+		}
+	}
+}
+
 func TestFECDisabled(t *testing.T) {
 	c, err := Parse("client", clientArgs("--fec=10:0"))
 	if err != nil {

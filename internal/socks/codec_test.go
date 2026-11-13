@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -237,5 +238,66 @@ func TestNewTarget(t *testing.T) {
 	}
 	if _, err := NewTarget("example.com", 0); err == nil {
 		t.Fatal("port 0 accepted")
+	}
+}
+
+func TestParseEntryAbsoluteFormQueryOnly(t *testing.T) {
+	raw := []byte("GET http://example.com?x=1 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	e, err := ParseEntry(bufio.NewReader(bytes.NewReader(raw)), &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Target.Address() != "example.com:80" {
+		t.Fatalf("target %q", e.Target.Address())
+	}
+	if !strings.HasPrefix(string(e.Prefix), "GET /?x=1 HTTP/1.1\r\n") {
+		t.Fatalf("query-only URI lost: %q", e.Prefix)
+	}
+}
+
+// The forward path relays body bytes verbatim, so the chunked framing headers
+// must survive the rewrite; dropping Transfer-Encoding would leave the origin
+// parsing chunks as a pipelined request.
+func TestParseEntryAbsoluteFormKeepsChunkedFraming(t *testing.T) {
+	raw := []byte("POST http://example.com/up HTTP/1.1\r\n" +
+		"Host: example.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n" +
+		"Trailer: X-Sum\r\n\r\n5\r\nhello\r\n0\r\nX-Sum: 1\r\n\r\n")
+	e, err := ParseEntry(bufio.NewReader(bytes.NewReader(raw)), &bytes.Buffer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := string(e.Prefix)
+	if !strings.Contains(head, "Transfer-Encoding: chunked") || !strings.Contains(head, "Trailer: X-Sum") {
+		t.Fatalf("framing headers stripped: %q", head)
+	}
+	if strings.Contains(head, "Content-Length") {
+		t.Fatalf("Content-Length kept beside Transfer-Encoding: %q", head)
+	}
+}
+
+// After the greeting, a rejected CONNECT must be answered with a SOCKS5 reply
+// so the client fails fast instead of waiting for a reset.
+func TestParseEntrySocks5FailureReply(t *testing.T) {
+	raw := []byte{socks5Version, 1, 0, socks5Version, 0x03, 0, AtypDomain, 1, 'a', 0, 80}
+	var out bytes.Buffer
+	if _, err := ParseEntry(bufio.NewReader(bytes.NewReader(raw)), &out); err == nil {
+		t.Fatal("UDP ASSOCIATE accepted")
+	}
+	reply := out.Bytes()
+	if len(reply) != 12 { // 2-byte greeting + 10-byte CONNECT failure
+		t.Fatalf("expected greeting + failure reply, got %v", reply)
+	}
+	if reply[0] != socks5Version || reply[1] != 0x00 || reply[2] != socks5Version || reply[3] != 0x01 {
+		t.Fatalf("bad reply %v", reply)
+	}
+}
+
+// A client that never sends a newline must hit the head limit, not grow the
+// read buffer until the process runs out of memory.
+func TestParseEntryHeadLimitOnEndlessLine(t *testing.T) {
+	raw := bytes.Repeat([]byte("A"), 4<<20)
+	_, err := ParseEntry(bufio.NewReaderSize(bytes.NewReader(raw), 64<<10), &bytes.Buffer{})
+	if !errors.Is(err, ErrHeadTooLarge) {
+		t.Fatalf("endless line: got %v, want ErrHeadTooLarge", err)
 	}
 }

@@ -208,7 +208,7 @@ async function start() {
   if (!cfg.host) return flashNote('请填写服务器地址', 'error');
   if (!(cfg.port >= 1 && cfg.port <= 65535)) return flashNote('UDP 端口需在 1..65535', 'error');
   if (!(cfg.listenPort >= 1 && cfg.listenPort <= 65535)) return flashNote('本地代理端口需在 1..65535', 'error');
-  if (!(cfg.mtu >= 576 && cfg.mtu <= 9000)) return flashNote('MTU 需在 576..9000', 'error');
+  if (!(cfg.mtu >= 576 && cfg.mtu <= 1500)) return flashNote('MTU 需在 576..1500', 'error');
   const key = el.key.value.replace(/\s+/g, '').replace(/^0x/i, '');
   if (!HEX32.test(key)) return flashNote('密钥需为 32 位十六进制', 'error');
   if (!/^\d+:\d+$/.test(cfg.fec)) return flashNote('FEC 需形如 10:3', 'error');
@@ -344,7 +344,7 @@ const MAX_LOG = 2000;
 // The tunnel prefixes every line with its own ISO timestamp. The shell draws a
 // local HH:MM:SS gutter instead, so the ISO copy is stripped: two clocks in one
 // row is noise, and the gutter is what the eye scans.
-const ISO_PREFIX = /^\[\d{4}-\d{2}-\d{2}T[\d:.]+Z\]\s*/;
+const ISO_PREFIX = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s*/;
 
 function addLog(entry) {
   entry.line = entry.line.replace(ISO_PREFIX, '');

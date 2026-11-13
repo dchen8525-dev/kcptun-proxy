@@ -103,7 +103,7 @@ kcptun-client --speedtest --seconds=8
 | `-b, --bind=IP[:P]` | server `0.0.0.0:4462`；client `127.0.0.1:1080` | 两端都表示「本地绑定」；缺端口自动补默认值。 |
 | `--peer=IP[:P]` | client 必需 | 服务端地址；缺端口补 4462。 |
 | `--fec=D:P` | `10:3` | Reed-Solomon 数据/校验分片；`P=0` 关闭 FEC。`D+P<=256`。**P 是固定值**，kcp-go 没有 FCP 的自适应奇偶控制器。 |
-| `--mtu=N` | `1400` | UDP 数据报字节数，**含** 20B IPv4 + 8B UDP 头；内部 `SetMtu(N-28)`。范围 576..9000。kcp-go 没有 PMTUD，两端必须一致。 |
+| `--mtu=N` | `1400` | UDP 数据报字节数，**含** 20B IPv4 + 8B UDP 头；内部 `SetMtu(N-28)`。范围 576..1500（kcp-go 把 UDP 载荷硬顶在 1472B，更大的值会被静默钳制，所以直接拒绝）。kcp-go 没有 PMTUD，两端必须一致。 |
 | `--log-level=LEVEL` | `info` | `debug\|info\|warn\|error\|off`，日志走 stderr。 |
 | `--log-file=PATH` | 无 | 追加写日志，自动建父目录；打开失败直接报错退出。 |
 | `--trace=PREFIX` | 无 | 每进程一个 `<PREFIX>-<role>-<pid>.jsonl` 连接事件日志。**不是** FCP 的 FEC 控制器 trace。 |

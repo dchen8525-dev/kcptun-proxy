@@ -57,6 +57,11 @@ func Listen(addr string, cl *tunnel.Client, rep *stats.Reporter, log *logx.Logge
 	if err != nil {
 		return nil, err
 	}
+	// The local entry has no authentication at all, so a non-loopback bind
+	// turns this machine into an open proxy for anyone who can reach the port.
+	if ta, ok := ln.Addr().(*net.TCPAddr); ok && !ta.IP.IsLoopback() {
+		log.Warn("proxy: listening on %s (not loopback); the local entry speaks unauthenticated SOCKS5/HTTP and is reachable by anyone who can reach this address", ln.Addr())
+	}
 	return &Server{ln: ln, cl: cl, rep: rep, log: log, tr: tr}, nil
 }
 
