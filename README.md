@@ -69,6 +69,18 @@ curl -x socks5h://127.0.0.1:1080 https://example.com
 
 默认 UDP 端口是 **4462**，不是 FCP 的 4460 / FCP-Node 的 4461 —— 三个隧道可以在同一台 VPS 上并存。放通防火墙：`ufw allow 4462/udp`。
 
+**部署 Linux 服务端到 VPS**：
+
+```bash
+scp dist/kcptun-server-linux-amd64 root@vps.example.com:/usr/local/bin/kcptun-server
+ssh root@vps.example.com 'chmod +x /usr/local/bin/kcptun-server && ufw allow 4462/udp'
+ssh root@vps.example.com '/usr/local/bin/kcptun-server --key=<HEX32> -b=0.0.0.0:4462 --fec=10:3'
+```
+
+`chmod +x` 不是可选项：Windows NTFS 保留不了 Linux 的执行位，`build.sh` 里的 `chmod` 在 NTFS 上是空操作，scp 之后必须补一次。产物是 `CGO_ENABLED=0` 的静态二进制，无外部依赖。生产环境把第三条命令换成 systemd unit（`Restart=always`）。
+
+`--key` 两端必须逐字相同，`--fec` 和 `--mtu` 也必须一致 —— 这一版没有参数协商，写错的表现是连不上或静默丢包，不会报错告诉你「两端配置不同」。
+
 一个本地端口同时说三种协议，和 FCP 一致：SOCKS5 CONNECT（无认证）、HTTP CONNECT、absolute-form HTTP（自动重写成 origin-form 并去掉 hop-by-hop 头）。SOCKS5 UDP ASSOCIATE 不支持。
 
 **自测**（不需要服务端、不需要 key）：
